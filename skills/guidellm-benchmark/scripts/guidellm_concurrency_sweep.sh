@@ -2,7 +2,8 @@
 #
 # guidellm_concurrency_sweep.sh
 # Runs a concurrency sweep (streams 1..128) for 4 workload shapes against a
-# vLLM server, collecting mx-smi GPU telemetry for the whole run, plus model
+# vLLM server, collecting GPU telemetry (mx-smi or nvidia-smi) for the whole
+# run, plus model
 # identity and how the serving container was launched (inspect template).
 #
 # Usage:
@@ -115,32 +116,65 @@ echo "Output Directory:   ${RUN_DIR}"
 echo "Stream values:      ${STREAM_VALUES[*]}"
 echo "Container Runtime:  ${RUNTIME}"
 echo "Profiles:           ${#YAML_MAP[@]} workloads × ${#STREAM_VALUES[@]} stream steps = $((${#YAML_MAP[@]} * ${#STREAM_VALUES[@]})) runs"
+# Duration estimate: sum(per-workload window × stream steps) + ~45 s
+# container/tokenizer overhead per run. Report it — under-estimating the
+# wall time is how a sweep "dies" in a closed terminal.
+WINDOW_S=0
+for name in "${!YAML_MAP[@]}"; do
+    WINDOW_S=$(( WINDOW_S + DURATION_MAP[$name] * ${#STREAM_VALUES[@]} ))
+done
+OVRH_S=$(( ${#YAML_MAP[@]} * ${#STREAM_VALUES[@]} * 45 ))
+echo "Estimated time:     ~$(( (WINDOW_S + OVRH_S) / 60 )) min total"
+echo "                   ($(( WINDOW_S / 60 )) min of measurement windows +"
+echo "                    ~$(( OVRH_S / 60 )) min per-run overhead)"
+echo "Progress check:     ls <run_dir>/profiles | wc -l   # ${#YAML_MAP[@]} x ${#STREAM_VALUES[@]} = done"
 echo "============================================================"
 
-# Start GPU telemetry (run on host: mx-smi writes directly into the run dir,
-# next to REPORT.md; note that mx-smi forbids -t when writing to a file, so we
-# loop until killed). Only start a new telemetry session for a fresh run; in
-# re-run mode an existing session (or an existing CSV) is left untouched.
-echo "Starting mx-smi telemetry in background on host..."
-if [ -n "${SWEEP_RUN_DIR:-}" ]; then
-    if pgrep -f "mx-smi -l 1000" >/dev/null 2>&1; then
-        echo "Telemetry already running, reusing it."
-        TELEMETRY_PID="$(pgrep -f 'mx-smi -l 1000' | head -1)"
-    else
-        rm -f "${RUN_DIR}/metrics.csv"
+# Start GPU telemetry (run on host; writes metrics.csv directly into the run
+# dir, next to REPORT.md). Tool selection: TELEMETRY_CMD override (a
+# space-separated command; the CSV path is appended as its last argument) >
+# mx-smi (MetaX) > nvidia-smi (NVIDIA hosts) > disabled. Only start a new
+# telemetry session for a fresh run; in re-run mode a live collector (or an
+# existing CSV) is left untouched. Never run two collectors: a second writer
+# duplicates 1-Hz rows in metrics.csv.
+echo "Starting GPU telemetry in background on host..."
+start_telemetry() {
+    rm -f "${RUN_DIR}/metrics.csv"
+    if [ -n "${TELEMETRY_CMD:-}" ]; then
+        # shellcheck disable=SC2086
+        ${TELEMETRY_CMD} "${RUN_DIR}/metrics.csv" \
+            > "${RUN_DIR}/telemetry_start.log" 2>&1 &
+    elif command -v mx-smi >/dev/null 2>&1; then
+        # mx-smi forbids -t when writing to a file, so we poll -l 1000 and
+        # kill it at the end.
         mx-smi -l 1000 -o "${RUN_DIR}/metrics.csv" \
             --show-memory --show-usage --show-temperature --show-pmbus-power \
             > "${RUN_DIR}/telemetry_start.log" 2>&1 &
-        TELEMETRY_PID=$!
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+            --format=csv -l 1 \
+            > "${RUN_DIR}/metrics.csv" \
+            2> "${RUN_DIR}/telemetry_start.log" &
+    else
+        echo "No mx-smi or nvidia-smi found; telemetry disabled."
+        return 0
+    fi
+    TELEMETRY_PID=$!
+}
+TELEMETRY_PID=""
+if [ -n "${SWEEP_RUN_DIR:-}" ]; then
+    if pgrep -f 'mx-smi -l 1000|nvidia-smi --query-gpu=timestamp' >/dev/null 2>&1; then
+        echo "Telemetry already running, reusing it."
+        TELEMETRY_PID="$(pgrep -f 'mx-smi -l 1000|nvidia-smi --query-gpu=timestamp' | head -1)"
+    elif [ -s "${RUN_DIR}/metrics.csv" ]; then
+        echo "Existing metrics.csv found; leaving telemetry untouched."
+    else
+        start_telemetry
     fi
 else
-    rm -f "${RUN_DIR}/metrics.csv"
-    mx-smi -l 1000 -o "${RUN_DIR}/metrics.csv" \
-        --show-memory --show-usage --show-temperature --show-pmbus-power \
-        > "${RUN_DIR}/telemetry_start.log" 2>&1 &
-    TELEMETRY_PID=$!
+    start_telemetry
 fi
-echo "Telemetry PID: ${TELEMETRY_PID}"
+echo "Telemetry PID: ${TELEMETRY_PID:-none}"
 
 # verify server ready
 wait_for_server() {
@@ -298,9 +332,17 @@ PYEOF
     done
 done
 
-# Stop telemetry
-echo "Stopping telemetry (PID ${TELEMETRY_PID})..."
-kill "${TELEMETRY_PID}" 2>/dev/null || true
+# Stop telemetry. Kill by command pattern, and by PID only after verifying
+# /proc/<pid>/cmdline still matches a collector pattern: a PID captured at
+# startup may be stale (PID reuse) and must not TERM an unrelated process.
+echo "Stopping telemetry (PID ${TELEMETRY_PID:-?})..."
+if [ -n "${TELEMETRY_PID}" ] && \
+   tr '\0' ' ' < "/proc/${TELEMETRY_PID}/cmdline" 2>/dev/null | \
+       grep -qE 'mx-smi -l 1000|nvidia-smi --query-gpu=timestamp'; then
+    kill "${TELEMETRY_PID}" 2>/dev/null || true
+fi
+pkill -f 'mx-smi -l 1000' 2>/dev/null || true
+pkill -f 'nvidia-smi --query-gpu=timestamp' 2>/dev/null || true
 sleep 3
 
 # Generate REPORT.md
@@ -362,8 +404,10 @@ sleep 3
     echo
     echo "## GPU telemetry"
     echo
-    echo "- \`mx-smi\` CSV: [\`metrics.csv\`](metrics.csv)"
-    echo "  (1 Hz sampling: memory, utilization, temperature, power)"
+    echo "- Telemetry CSV (1 Hz: timestamp, utilization, memory, temperature,"
+    echo "  power; source: mx-smi or nvidia-smi, whichever is on the host):"
+    echo "  [\`metrics.csv\`](metrics.csv)"
+    echo "  If two collectors were ever active, deduplicate by the time column."
     echo
     echo "---"
     echo "*Report generated by guidellm-benchmark skill.*"

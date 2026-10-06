@@ -1,5 +1,5 @@
 ---
-description: Benchmark LLM inference endpoints (vLLM, SGLang, etc.) with GuideLLM using docker or nerdctl containers and image ghcr.io/vllm-project/guidellm:latest. Two bundled orchestrators — a concurrency sweep (4 workload shapes x streams 1..128 with per-workload windows, resumable re-runs, and mx-smi GPU telemetry) and an all-profile runner (synchronous, throughput, concurrent, constant, poisson, sweep). Every run also captures model identity and how the serving container was launched (full inspect plus mounts/devices/ports/env/ulimits/server-args and model-dir listing) into a timestamped folder with csv, json, html, png artifacts and a REPORT.md of links — raw metrics are never loaded into context. Use this skill whenever the user mentions GuideLLM or guidellm, load/throughput benchmarks, latency (TTFT/TPOT) measurements, concurrency sweeps, tok/s vs streams, capacity or saturation testing of an OpenAI-compatible server, GPU telemetry during benchmarks — even if GuideLLM is not named explicitly.
+description: Benchmark LLM inference endpoints (vLLM, SGLang, etc.) with GuideLLM using docker or nerdctl containers and image ghcr.io/vllm-project/guidellm:latest. Two bundled orchestrators — a concurrency sweep (4 workload shapes x streams 1..128 with per-workload windows, resumable re-runs, and host GPU telemetry — mx-smi or nvidia-smi, auto-detected) and an all-profile runner (synchronous, throughput, concurrent, constant, poisson, sweep). Every run also captures model identity and how the serving container was launched (full inspect plus mounts/devices/ports/env/ulimits/server-args and model-dir listing) into a timestamped folder with csv, json, html, png artifacts and a REPORT.md of links — raw metrics are never loaded into context. Use this skill whenever the user mentions GuideLLM or guidellm, load/throughput benchmarks, latency (TTFT/TPOT) measurements, concurrency sweeps, tok/s vs streams, capacity or saturation testing of an OpenAI-compatible server, GPU telemetry during benchmarks — even if GuideLLM is not named explicitly.
 license: MIT
 name: guidellm-benchmark
 ---
@@ -13,7 +13,8 @@ Run comprehensive load and performance benchmarks against OpenAI-compatible LLM 
 - **Runtimes**: `docker` or `nerdctl` (both supported by both orchestrator scripts; serving-container inspect automatically falls back to the other runtime)
 - **Network Mode**: `--network host` (GuideLLM reaches localhost endpoints directly)
 - **Bundled orchestrators**:
-  - `scripts/guidellm_concurrency_sweep.sh` — capacity/saturation study: 4 workload shapes × stream sweep (1..128), per-workload time windows, `mx-smi` GPU telemetry for the whole run, resumable re-runs
+  - `scripts/guidellm_concurrency_sweep.sh` — capacity/saturation study: 4 workload shapes × stream sweep (1..128), per-workload time windows, GPU telemetry for the whole run (`mx-smi`, or `nvidia-smi` fallback on NVIDIA hosts, or `TELEMETRY_CMD`), resumable re-runs, ETA banner
+  - `scripts/sweep_summary.py` — turns a finished run dir's `benchmarks.json` files into the curated aggregate table + headlines that get appended to `REPORT.md`
   - `scripts/run_benchmarks.sh` — full load-profile matrix (all 6 GuideLLM profiles), workload token presets, `--dry-run`
 - **Artifacts**: `csv`, `json`, `html`, `png` per run + `REPORT.md` index of relative links
 - **Output folders** (created in the current working directory): `guidellm_run_YYYYMMDD_HHMMSS/` (all-profile runner) or `guidellm_sweep_YYYYMMDD_HHMMSS/` (concurrency sweep)
@@ -105,7 +106,7 @@ Right after the run directory is created (before any benchmark), and **before** 
 | `serving_launch_info.txt` | `IMAGE`, `ENTRYPOINT`, `CMD` (full server args), `MOUNTS`, `DEVICES`, `PORTS`, `ENV`, `GROUP_ADD`, `SECURITY_OPT`, `ULIMITS`, `CAP_ADD`, then `=== MODEL CHECK ===` listing the host model dir (weights/tokenizer source) |
 | `serving_container_inspect.json` | Verbatim full output of `<runtime> inspect <container>` — the ground truth if the template misses a field |
 | `REPORT.md` | Environment summary (model id, image, server args, durations, runtime) + relative links to metadata, artifacts and telemetry — never raw metric dumps |
-| `metrics.csv` | (sweep only) `mx-smi` at 1 Hz: memory, utilization, temperature, power, for the whole sweep — written into the run dir next to `REPORT.md` |
+| `metrics.csv` | (sweep only) 1 Hz GPU telemetry (source: `mx-smi` on MetaX hosts, `nvidia-smi` fallback on NVIDIA hosts): timestamp, utilization, memory, temperature, power — written into the run dir next to `REPORT.md` |
 
 Capturing launch info up-front matters for two reasons: a sweep can die hours in (took down a prior run via SIGHUP), and identical model weights served with different `max-num-seqs` / `--no-enable-prefix-caching` / quant flags produce completely different curves. The launch template is defined verbatim in `references/report-template.md`.
 
@@ -178,9 +179,13 @@ Follow [references/report-template.md](references/report-template.md): header + 
 
 ## Reading a sweep's results
 
-Parse `benchmarks.json` per profile (keys: `metrics.request_totals`, `requests_per_second`, `time_to_first_token_ms`, `time_per_output_token_ms`, `output_tokens_per_second`) with a small Python script that prints one aggregate row per run — not by dumping JSON into chat.
+Parse `benchmarks.json` per profile (keys: `metrics.request_totals`, `requests_per_second`, `time_to_first_token_ms`, `time_per_output_token_ms`, `output_tokens_per_second`) — not by dumping JSON into chat. For the run-level aggregate table, **do not hand-transcribe numbers** (a hand-typed table drifted from the JSON in a real sweep): generate it and append its output to `REPORT.md`:
 
-- **Three counters**: `successful` / `errored` / `incomplete` (from `request_totals`).
+```bash
+python3 scripts/sweep_summary.py <guidellm_sweep_YYYYMMDD_HHMMSS>
+```
+
+- **Three counters**: `successful` / `errored` / `incomplete` (from `request_totals`). `request_totals` also carries a `total` key (and more) — compute completion as `successful / (successful + errored + incomplete)`, never `successful / sum(dict.values())`.
   - `completion = successful / total`. Requests still in flight at the window cutoff are `incomplete` — at high streams a falling completion rate is the signature of **oversaturation**, a measurement of where the queue stops draining, *not* a failure. A healthy sweep has `errored = 0` everywhere.
   - Re-run mode uses exactly this: `errored == 0 && completion >= 0.90` → profile is "already good" and skipped.
 - **Saturation point** = first stream step where median TTFT jumps past ~10 s (pre-queued requests dominate).
@@ -204,11 +209,15 @@ When reporting to the user: summary of environment + paths to `REPORT.md` + at m
 4. **Long sweeps die with the terminal**: launch with `setsid ... </dev/null >log 2>&1 &` (SIGHUP hit a previous run and killed the orchestrator silently).
 5. **Resume, don't restart**: `SWEEP_RUN_DIR=<existing dir>` re-runs only failed/incomplete profiles — healthy 28-run sweeps re-check in seconds.
 6. **The server can die mid-sweep** (engine crash, GPU driver wedging — e.g. MetaX ringbuf exhaustion leaves a zombie worker when the container has no `--init`). The orchestrator only probes `/v1/models` between runs; it will not resurrect the container. Recovery: fix/recreate the serving container (prefer `--init` so workers get reaped), then resume with `SWEEP_RUN_DIR`. Record what happened as an incident note appended to `REPORT.md`.
-7. **`mx-smi` telemetry**: `mx-smi -t` cannot be combined with `-o file` — the script polls with `-l 1000` and is stopped by `kill <pid>`; only one collector per `metrics.csv` (re-run mode reuses a live collector instead of starting a second writer).
+7. **GPU telemetry is auto-selected**: `TELEMETRY_CMD` override (a space-separated command that gets the CSV path as its last arg) → `mx-smi` (MetaX; `-t` cannot be combined with `-o file`, so the script polls with `-l 1000`) → `nvidia-smi` (`--query-gpu=timestamp,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv -l 1`) → disabled. Never run two collectors: a second writer duplicates 1-Hz rows in `metrics.csv` (dedupe by the time column if it happened). At the end the script kills by PID **and** by command pattern — a PID captured at start can be stale (PID reuse) and a manually-started collector would otherwise keep writing after the sweep ends.
 8. **YAML configs are regenerated** at every sweep invocation (stale `guidellm_concurrent_*.yaml` cleaned first) — edits to them do not survive a re-run; change `YAML_MAP`/`DURATION_MAP` in the script instead.
 9. **GuideLLM needs no GPU**: weights are mounted `:ro`, the profile dir `:rw` — nothing else. It only talks HTTP to the endpoint, so no `/dev/*` or `shm_size` tuning applies to the benchmark container (those matter only for the serving side, see repo compose files for MetaX).
 10. **`/results` must be pre-created and world-writable** — both scripts `mkdir -p` the profile dir and `chmod 777` it before `docker run`. If the bind-mount target is missing at run time, Docker auto-creates it **root-owned** and the non-root GuideLLM container (uid 1001) dies with `PermissionError: /results/benchmarks.csv`.
 11. **Offline tokenizer (air-gapped hosts)** — GuideLLM loads its tokenizer from HuggingFace unless told otherwise; with no external network that download fails during output finalization with `httpx.ConnectError: [Errno 101] Network is unreachable`, so `csv`/`json` land but `html`/`png` are lost. Both scripts avoid it: the sweep mounts `HOST_MODELS_DIR` and sets `tokenizer: huggingface_auto` in the YAML; `run_benchmarks.sh` mounts `--models-dir` (auto-detected from the serving container's model arg when omitted) and passes `--tokenizer '{"kind":"huggingface_auto","model":"/models",...}'`. Treat `html`/`png` as best-effort — `csv`/`json` are the source of truth.
+12. **Quoting the ETA**: the sweep banner prints an estimate (sum of windows × stream steps + ~45 s per-run overhead). For the default 28-run matrix that is **~3.5 h of windows + ~20 min ≈ 3 h 40–50 min**, not 2 h — under-quoting is how the run "dies in a closed terminal". Progress in one line: `ls <run_dir>/profiles | wc -l` (28 = done).
+13. **Non-default host layout**: the script defaults are one specific production layout. On any other machine set all four: `SERVING_CONTAINER` (inspect target), `HOST_MODELS_DIR` (host path with the tokenizer files; mounted to `/models` and listed in launch info), `TOKENIZER_MODEL` (path *inside* the GuideLLM container, i.e. under `/models`), and `CONFIGS_DIR` (else the script `mkdir -p`s a stray dir in the default layout).
+14. **Checking GPU visibility in the serving image**: the vLLM image entrypoint is `vllm serve`, so a bare `docker run ... image python3 -c ...` parses `python3` as a server flag and fails. Use `docker run --rm --gpus all --entrypoint python3 <vllm-image> -c "import torch; print(torch.cuda.is_available())"`. If `cuInit` returns 802 "system not yet initialized" on a Hopper SXM in a KVM VM without NVSwitch devices (`Fabric State: In Progress`, fabricmanager "NVSwitch driver: Nothing to do"), and NVLink is not needed there: `/etc/modprobe.d/nvidia-nvlink.conf` → `options nvidia NVreg_NvLinkDisable=1` (modprobe.d name *with* the `NVreg_` prefix; `/proc/driver/nvidia/params` shows it *without*), reload the nvidia modules, `systemctl disable --now nvidia-fabricmanager` → `cuInit` returns 0.
+15. **`request_totals` has a `total` key (and more)** — compute completion from `successful/(successful+errored+incomplete)` only; `successful/sum(dict.values())` understates it 2×.
 
 ---
 
