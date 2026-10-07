@@ -168,6 +168,9 @@ cheap — finished short-window runs stay, incomplete-heavy ones get re-measured
 - Falling `completion` at high streams marks the **saturation point**, not a regression; the guide used for the example sweep is "first median TTFT > 10 s".
 - `errored > 0` in any row is a real incident (engine crash, transport error) — recover the server and re-run with `SWEEP_RUN_DIR` to replace just those rows.
 - GPU telemetry (1 Hz; `mx-smi` on MetaX hosts, `nvidia-smi` fallback on NVIDIA hosts) runs for the whole sweep, so individual runs can be correlated by wall-clock placement of their directories' mtime window.
+- Scheduler telemetry (`server_metrics.csv`, vLLM `/metrics` at 2 s) adds the **server-side** view: rising `num_requests_waiting` + `kv_cache_usage_perc` → ~1 with a growing `num_preemptions_total` counter is the KV-cache-oversubscription signature behind the TTFT knee at streams > `max_num_seqs`. Use it to attribute the 192/256 steps to the scheduler, not to the model.
+- The pre-grid **warm-up** (300 s quick 256/128 at 32 streams + 30 s queue drain, `WARMUP=0` disables, skipped on re-run) absorbs JIT/allocator/cold-start so the first grid step measures steady state — per the serving-benchmarking methodology (100+ requests or 10k output tokens before measuring, then let the queue drain; see IETF `draft-gaikwad-llm-benchmarking-methodology`).
+- The aggregate table reports latency as **median/p99** (successful subset) plus **ITL**; the p99 spread (P99/P50 ratio) is the tail-heaviness signal the medians alone hide.
 
 ### Failure modes the orchestrator defends against
 

@@ -17,7 +17,7 @@
 #
 # Overridable via env (defaults = current production layout):
 #   SERVING_CONTAINER RUNTIME ENDPOINT GUIDELLM_IMAGE HOST_MODELS_DIR
-#   CONFIGS_DIR TOKENIZER_MODEL SWEEP_STREAMS
+#   CONFIGS_DIR TOKENIZER_MODEL SWEEP_STREAMS WARMUP WARMUP_STREAMS
 #
 
 set -euo pipefail
@@ -39,7 +39,8 @@ fi
 
 # Clean up any previous yaml
 mkdir -p "${CONFIGS_DIR}"
-rm -f "${CONFIGS_DIR}"/guidellm_concurrent_*.yaml
+rm -f "${CONFIGS_DIR}"/guidellm_concurrent_*.yaml \
+      "${CONFIGS_DIR}"/guidellm_warmup_*.yaml
 
 declare -A YAML_MAP
 YAML_MAP["8k_1k"]="8192:1024"
@@ -130,6 +131,7 @@ OVRH_S=$(( ${#YAML_MAP[@]} * ${#STREAM_VALUES[@]} * 45 ))
 echo "Estimated time:     ~$(( (WINDOW_S + OVRH_S) / 60 )) min total"
 echo "                   ($(( WINDOW_S / 60 )) min of measurement windows +"
 echo "                    ~$(( OVRH_S / 60 )) min per-run overhead)"
+echo "Warm-up:            ${WARMUP:-1} (300 s quick 256/128, streams=${WARMUP_STREAMS:-32} + 30 s drain; fresh runs only; WARMUP=0 disables)"
 echo "Progress check:     ls <run_dir>/profiles | wc -l   # ${#YAML_MAP[@]} x ${#STREAM_VALUES[@]} = done"
 echo "============================================================"
 
@@ -178,6 +180,48 @@ else
     start_telemetry
 fi
 echo "Telemetry PID: ${TELEMETRY_PID:-none}"
+
+# Start vLLM server-side metrics poller (run on host: the serving endpoint
+# exposes Prometheus /metrics). This is what attributes the 192/256
+# oversubscription steps to scheduler behavior (queue depth, KV-cache usage,
+# preemptions) rather than just the TTFT curve. Writes server_metrics.csv
+# into the run dir. The poller runs as `bash -c` with a marker as $0 so it
+# can be found/stopped by pattern without matching the sweep script itself.
+# In re-run mode a live poller (or an existing file) is left untouched; a
+# fresh poller appends (header written only when the file is new).
+echo "Starting vLLM /metrics poller in background on host..."
+start_server_metrics() {
+    [ -s "${RUN_DIR}/server_metrics.csv" ] || \
+        printf 'epoch,metric,value\n' > "${RUN_DIR}/server_metrics.csv"
+    # bash -c body: $1 = csv path, $2 = endpoint; $0 carries the marker so
+    # pgrep/pkill -f can find the loop (and only the loop).
+    bash -c '
+        out="$1"; url="$2"
+        while :; do
+            ts=$(date +%s)
+            curl -s --max-time 2 "$url/metrics" 2>/dev/null |
+                grep -E "^vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc|gpu_cache_usage_info|num_preemptions(_total)?)(\{| )" 2>/dev/null |
+                sed -E "s/^vllm:/$ts,/" |
+                sed -E "s/[[:space:]]+([0-9eE.+-]+)$/,\\1/" >> "$out" || true
+            sleep 2
+        done' "__sweep_server_metrics" "${RUN_DIR}/server_metrics.csv" \
+        "${ENDPOINT}" > "${RUN_DIR}/server_metrics_start.log" 2>&1 &
+    SERVER_METRICS_PID=$!
+}
+SERVER_METRICS_PID=""
+if [ -n "${SWEEP_RUN_DIR:-}" ]; then
+    if pgrep -f '__sweep_server_metrics' >/dev/null 2>&1; then
+        echo "Server-metrics poller already running, reusing it."
+        SERVER_METRICS_PID="$(pgrep -f '__sweep_server_metrics' | head -1)"
+    elif [ -s "${RUN_DIR}/server_metrics.csv" ]; then
+        echo "Existing server_metrics.csv found; leaving it untouched."
+    else
+        start_server_metrics
+    fi
+else
+    start_server_metrics
+fi
+echo "Server-metrics PID: ${SERVER_METRICS_PID:-none}"
 
 # verify server ready
 wait_for_server() {
@@ -271,6 +315,60 @@ fi
 echo "Model id: ${MODEL_ID}"
 echo "Serving image: ${SERVING_IMAGE}"
 
+# ------------------------------------------------------------------
+# Warm-up: absorb JIT / allocator / cold-start effects so the first
+# grid step measures steady state, not a warming engine (serving
+# benchmark methodology: 100+ requests or 10k output tokens before
+# measuring, then let the queue drain). Skipped in re-run mode: the
+# server already served the original sweep.
+# ------------------------------------------------------------------
+if [ "${WARMUP:-1}" != "0" ] && [ -z "${SWEEP_RUN_DIR:-}" ]; then
+    warmup_yaml="${CONFIGS_DIR}/guidellm_warmup_quick.yaml"
+    cat > "${warmup_yaml}" <<EOF
+spec:
+  backend:
+    kind: openai_http
+    target: ${ENDPOINT}
+
+  tokenizer:
+    kind: huggingface_auto
+    model: ${TOKENIZER_MODEL}
+
+  data:
+    - kind: synthetic_text
+      prompt_tokens: 256
+      output_tokens: 128
+
+  constraints:
+    - kind: max_duration
+      seconds: 300
+
+  profile:
+    kind: concurrent
+
+  outputs:
+    - kind: json
+      path: /results/benchmarks.json
+EOF
+    warmup_dir="${RUN_DIR}/warmup"
+    mkdir -p "${warmup_dir}"
+    chmod 777 "${warmup_dir}" 2>/dev/null || true
+    echo "Warm-up before the grid: quick 256/128, streams=${WARMUP_STREAMS:-32}, 300 s..."
+    if "$RUNTIME" run --rm \
+            --network host \
+            -v "${HOST_MODELS_DIR}:/models:ro" \
+            -v "${warmup_yaml}:/tmp/warmup.yaml:ro" \
+            -v "${warmup_dir}:/results:rw" \
+            "$GUIDELLM_IMAGE" \
+            run --config /tmp/warmup.yaml \
+            --profile "kind=concurrent,streams=${WARMUP_STREAMS:-32}"; then
+        echo "Warm-up complete; letting the queue drain (30 s)..."
+        sleep 30
+    else
+        echo "Warm-up failed (continuing with the grid); check the serving container."
+    fi
+fi
+
 # Run each workload × each stream
 for name in "${!YAML_MAP[@]}"; do
     for stream in "${STREAM_VALUES[@]}"; do
@@ -346,6 +444,16 @@ if [ -n "${TELEMETRY_PID}" ] && \
 fi
 pkill -f 'mx-smi -l 1000' 2>/dev/null || true
 pkill -f 'nvidia-smi --query-gpu=timestamp' 2>/dev/null || true
+
+# Stop the server-metrics poller. Same stale-PID guard as telemetry: only
+# kill after /proc/<pid>/cmdline still carries the poller marker.
+echo "Stopping server-metrics poller (PID ${SERVER_METRICS_PID:-?})..."
+if [ -n "${SERVER_METRICS_PID}" ] && \
+   tr '\0' ' ' < "/proc/${SERVER_METRICS_PID}/cmdline" 2>/dev/null | \
+       grep -q '__sweep_server_metrics'; then
+    kill "${SERVER_METRICS_PID}" 2>/dev/null || true
+fi
+pkill -f '__sweep_server_metrics' 2>/dev/null || true
 sleep 3
 
 # Generate REPORT.md
@@ -363,6 +471,7 @@ sleep 3
     echo "- **Tokenizer (synthetic prompts)**: \`${TOKENIZER_MODEL}\`"
     echo "- **Streams sweep**: ${STREAM_VALUES[*]}"
     echo "- **Total runs**: $((${#YAML_MAP[@]} * ${#STREAM_VALUES[@]}))"
+    echo "- **Warm-up**: \`${WARMUP:-1}\` (300 s quick 256/128 at streams=${WARMUP_STREAMS:-32} + 30 s queue drain; fresh runs only — skipped when \`SWEEP_RUN_DIR\` is set)"
     echo
     echo "## Server launch arguments (from container CMD)"
     echo
@@ -411,6 +520,15 @@ sleep 3
     echo "  power; source: mx-smi or nvidia-smi, whichever is on the host):"
     echo "  [\`metrics.csv\`](metrics.csv)"
     echo "  If two collectors were ever active, deduplicate by the time column."
+    echo
+    echo "## Scheduler telemetry (vLLM \`${ENDPOINT}/metrics\`, 2 s sampling)"
+    echo
+    echo "- Queue depth, KV-cache usage and preemption counters:"
+    echo "  [\`server_metrics.csv\`](server_metrics.csv)"
+    echo "  Use it to attribute the oversubscription steps (streams >"
+    echo "  max_num_seqs): rising \`num_requests_waiting\` /"
+    echo "  \`kv_cache_usage_perc\` with a growing \`num_preemptions_total\`"
+    echo "  is the KV-cache-oversubscription signature behind the TTFT knee."
     echo
     echo "---"
     echo "*Report generated by guidellm-benchmark skill.*"

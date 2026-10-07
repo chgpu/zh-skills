@@ -6,7 +6,8 @@ Usage:
 
 Reads profiles/*/benchmarks.json (source of truth) and prints:
   * the aggregate table (medians, groups of 3 stream steps,
-    8k_1k final-row peak tok/s bold),
+    8k_1k final-row peak tok/s bold; latency cells are med/p99 —
+    percentiles over the successful subset),
   * headline bullets (single-stream baseline, saturation check, per-workload peaks).
 Append the output to the run's REPORT.md instead of hand-transcribing
 numbers — hand-typed tables have drifted from the JSON before.
@@ -34,14 +35,33 @@ def completion(rt):
     return 100.0 * rt["successful"] / tot if tot else 0.0
 
 
+def p99_of(m, key):
+    s = m[key]["successful"]
+    return s.get("percentiles", {}).get("p99", s["median"])
+
+
+def itl_of(m, kind):
+    s = m.get("inter_token_latency_ms", {}).get("successful")
+    if not s:
+        return None
+    if kind == "p99":
+        return s.get("percentiles", {}).get("p99", s.get("median"))
+    return s.get("median")
+
+
+def lat_cell(v):
+    return "n/a" if v is None else f"{v:.0f}"
+
+
 def table_row(wl, steps, data, peak_row=False):
     label = LABELS.get(wl, wl)
     sl = " / ".join(str(s) for s in steps)
     if len(steps) == 1:
-        rt, o, tt, tp = data[wl][steps[0]]
+        rt, o, tt, tp, tt99, tp99, im, i99 = data[wl][steps[0]]
         cnt = f"{rt['successful']}/{rt['errored']}/{rt['incomplete']} · {completion(rt):.1f}%"
         tos = f"**{o:.0f}**" if peak_row else f"{o:.0f}"
-        tfs, tps = f"{tt:.0f}", f"{tp:.2f}"
+        tfs, tps = f"{tt:.0f}/{tt99:.0f}", f"{tp:.2f}/{tp99:.2f}"
+        il = f"{lat_cell(im)}/{lat_cell(i99)}"
     else:
         cnt = " · ".join(
             f"{data[wl][s][0]['successful']}/{data[wl][s][0]['errored']}"
@@ -50,9 +70,11 @@ def table_row(wl, steps, data, peak_row=False):
         tos = "/".join(
             (f"**{data[wl][s][1]:.0f}**" if peak_row and s == steps[-1]
              else f"{data[wl][s][1]:.0f}") for s in steps)
-        tfs = "/".join(f"{data[wl][s][2]:.0f}" for s in steps)
-        tps = "/".join(f"{data[wl][s][3]:.2f}" for s in steps)
-    return f"| {label} | {sl} | {cnt} | {tos} | {tfs} | {tps} |"
+        tfs = "/".join(f"{data[wl][s][2]:.0f}/{data[wl][s][4]:.0f}" for s in steps)
+        tps = "/".join(f"{data[wl][s][3]:.2f}/{data[wl][s][5]:.2f}" for s in steps)
+        il = "/".join(f"{lat_cell(data[wl][s][6])}/{lat_cell(data[wl][s][7])}"
+                      for s in steps)
+    return f"| {label} | {sl} | {cnt} | {tos} | {tfs} | {tps} | {il} |"
 
 
 def main():
@@ -69,6 +91,10 @@ def main():
             m["output_tokens_per_second"]["successful"]["median"],
             m["time_to_first_token_ms"]["successful"]["median"],
             m["time_per_output_token_ms"]["successful"]["median"],
+            p99_of(m, "time_to_first_token_ms"),
+            p99_of(m, "time_per_output_token_ms"),
+            itl_of(m, "median"),
+            itl_of(m, "p99"),
         )
     if not data:
         sys.exit(f"no profiles/*/benchmarks.json under {run_dir}")
@@ -78,9 +104,12 @@ def main():
 
     print("## Aggregate summary (curated, medians from `benchmarks.json`)")
     print()
+    print("Latency cells are `median/p99` over the successful subset.")
+    print()
     print("| Workload | streams | ok / err / incomp · completion "
-          "| output tok/s (med) | TTFT med (ms) | TPOT med (ms) |")
-    print("|---|---|---|---|---|---|")
+          "| output tok/s (med) | TTFT med/p99 (ms) | TPOT med/p99 (ms) "
+          "| ITL med/p99 (ms) |")
+    print("|---|---|---|---|---|---|---|")
     for wl in sorted(data):
         for i, g in enumerate(groups):
             g = [s for s in g if s in data[wl]]
@@ -110,9 +139,12 @@ def main():
         hi = max(m[1] for m in base.values())
         tps = [m[3] for m in base.values()]
         tt = [m[2] for m in base.values()]
+        il = [m[6] for m in base.values() if m[6] is not None]
+        itl_part = (f", ITL ~{min(il):.0f}–{max(il):.0f} ms" if il else "")
         print(f"- **Single-stream baseline**: ~{lo:.0f}–{hi:.0f} tok/s per stream, "
-              f"TPOT ~{min(tps):.1f}–{max(tps):.1f} ms (per-request decode), "
-              f"TTFT {min(tt):.0f}–{max(tt):.0f} ms depending on prompt length.")
+              f"TPOT ~{min(tps):.1f}–{max(tps):.1f} ms (per-request decode)"
+              f"{itl_part}, TTFT {min(tt):.0f}–{max(tt):.0f} ms depending on "
+              f"prompt length.")
     sat = ("not saturated" if max_ttft < SATURATION_TTFT_MS
            else "SATURATED (median TTFT ≥ 10 s)")
     print(f"- **Saturation inside the grid**: {sat} (max median TTFT "
