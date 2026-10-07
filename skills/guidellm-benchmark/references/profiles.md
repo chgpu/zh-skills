@@ -145,7 +145,7 @@ What `scripts/guidellm_concurrency_sweep.sh` does beyond a single `concurrent` r
 
 ### The matrix
 
-- **Workloads × streams**: 4 token shapes (table above) × stream steps `1 4 8 16 32 64 128` → 28 runs. Streams go up to the serving `--max-num-seqs` (e.g. 128), so the top step probes genuine server admission rather than client-side throttling.
+- **Workloads × streams**: 4 token shapes (table above) × stream steps `1 4 8 16 32 64 128 192 256` → 36 runs. The baseline grid reaches 256 to locate the true TTFT knee / decode plateau with the serving default `--max-num-seqs=128` (vLLM's `DEFAULT_MAX_NUM_SEQS`) — the excess streams queue in vLLM, which is exactly the saturation signal being measured.
 - **One config YAML per workload** (`guidellm_concurrent_<name>.yaml`) holds backend, tokenizer, data, window constraint and outputs; only `--profile kind=concurrent,streams=N` is overridden from the CLI per run. The tokenizer must be a real HF path mounted into the GuideLLM container (`-v <host-models>:/models:ro`) so synthetic token counts match the served tokenizer.
 
 ### Per-workload windows (not one global duration)

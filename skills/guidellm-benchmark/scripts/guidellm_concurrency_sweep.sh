@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # guidellm_concurrency_sweep.sh
-# Runs a concurrency sweep (streams 1..128) for 4 workload shapes against a
+# Runs a concurrency sweep (streams 1..256) for 4 workload shapes against a
 # vLLM server, collecting GPU telemetry (mx-smi or nvidia-smi) for the whole
 # run, plus model
 # identity and how the serving container was launched (inspect template).
@@ -29,7 +29,10 @@ ENDPOINT="${ENDPOINT:-http://localhost:8000}"
 HOST_MODELS_DIR="${HOST_MODELS_DIR:-/home/rgainanov/metax-vllm/models}"
 CONFIGS_DIR="${CONFIGS_DIR:-/home/rgainanov/metax-vllm/configs}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-/models/metax-tech/Qwen3.8-27B-W8A8}"
-STREAM_VALUES=(1 4 8 16 32 64 128)  # 128 added, matching max_num_seqs=128
+# Baseline stream grid. vLLM's default max_num_seqs is 128
+# (SchedulerConfig.DEFAULT_MAX_NUM_SEQS), so 192/256 exceed the admission cap
+# and queue — exactly the saturation signal we want to measure.
+STREAM_VALUES=(1 4 8 16 32 64 128 192 256)
 if [ -n "${SWEEP_STREAMS:-}" ]; then
     read -ra STREAM_VALUES <<< "${SWEEP_STREAMS}"
 fi
