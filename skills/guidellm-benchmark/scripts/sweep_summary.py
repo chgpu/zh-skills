@@ -157,8 +157,8 @@ def main():
               f"{LABELS.get(wl, wl)}: **{v:.0f}** @{s} streams.")
     if climbing:
         print(f"- Still climbing at the top of the grid: {', '.join(climbing)} "
-              "→ the server is not at its knee; extend the stream grid "
-              "(e.g. 192/256) to pin it.")
+               "→ the server is not at its knee; extend the stream grid "
+               "past the top step to pin it.")
 
 
 if __name__ == "__main__":

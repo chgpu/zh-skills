@@ -52,7 +52,7 @@ setsid bash .agents/skills/guidellm-benchmark/scripts/guidellm_concurrency_sweep
   </dev/null >sweep.log 2>&1 &
 ```
 
-Sweep matrix: workloads `8k_1k` (8192→1024) · `chat_2k_512` (2048→512) · `reasoning_4k_2k` (4096→2048) · `quick_256_128` (256→128) × streams `1 4 8 16 32 64 128 192 256` (= 36 runs), with windows **180 s (quick) / 420 s (chat) / 600 s (reasoning, 8k)**. The 192/256 steps extend past the old 1..128 grid to find the true TTFT knee; with vLLM's default `max_num_seqs=128` (SchedulerConfig.DEFAULT_MAX_NUM_SEQS) they exceed the admission cap and queue — the saturation signal we are measuring. Results land in `guidellm_sweep_*/profiles/<workload>_stream_<N>/`.
+Sweep matrix: workloads `8k_1k` (8192→1024) · `chat_2k_512` (2048→512) · `reasoning_4k_2k` (4096→2048) · `quick_256_128` (256→128) × streams `1 4 8 16 32 64 128 192 256` (= 36 runs), with windows **180 s (quick) / 420 s (chat) / 600 s (reasoning, 8k)**. The 192/256 steps probe the effective cap of the running server: with the common `max_num_seqs=128` they queue at admission; with a higher cap (e.g. 256) the TTFT knee moves to KV-cache exhaustion — `server_metrics.csv` tells the two apart (check the server's actual `--max-num-seqs`, gotcha 16). Results land in `guidellm_sweep_*/profiles/<workload>_stream_<N>/`.
 
 ### Option B — All load profiles
 
@@ -194,7 +194,7 @@ python3 scripts/sweep_summary.py <guidellm_sweep_YYYYMMDD_HHMMSS>
 - **Single-stream rows** baseline decode: median TPOT ≈ per-token latency; output tok/s ≈ `output_tokens / TPOT`.
 - **Latency cells are `med/p99`** (successful subset) plus an **ITL** column — the p99/P50 ratio is the tail-heaviness signal medians alone hide; ITL p99 growing at high streams flags scheduler-level stalls.
 - **GPU correlation**: overlay `metrics.csv` (1 Hz, in the run dir) on the timeline of a run to see utilization/memory/power at saturation.
-- **Scheduler correlation**: overlay `server_metrics.csv` (vLLM `/metrics`, 2 s) to attribute the oversubscription steps (streams > `max_num_seqs`) to the server: rising `num_requests_waiting` + `kv_cache_usage_perc` → ~1 + growing `num_preemptions_total` = KV-cache oversubscription, not model slowness.
+- **Scheduler correlation**: overlay `server_metrics.csv` (vLLM `/metrics`, 2 s) to attribute the top-of-grid steps to the server, distinguishing the two knee signatures: `num_requests_running` pinned at the cap with growing `num_requests_waiting` below it = **admission queue** (streams > `max_num_seqs`); `kv_cache_usage_perc` → ~1 (running < streams, preemptions rising) = **KV-cache exhaustion** (streams within the cap but KV full) — neither is model slowness.
 - Pre-grid **warm-up** (300 s quick 256/128 at 32 streams + 30 s queue drain; `WARMUP=0` disables, skipped on re-run) absorbs JIT/cold-start so the first grid step is steady state.
 - Worked example with full tables — peaks, saturation points, per-run rows and the incidents log of the `guidellm_sweep_20260924_223015` run (Qwen3.8-27B-W8A8, 28 runs, 0 errors): [references/example-sweep-qwen38-27b.md](references/example-sweep-qwen38-27b.md).
 
